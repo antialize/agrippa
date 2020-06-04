@@ -1,0 +1,19 @@
+[package]
+name = "agrippa"
+version = "0.1.0"
+authors = ["Jakob Truelsen <jakob@scalgo.com>"]
+edition = "2018"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+
+
+[build-dependencies]
+bindgen = "0.54"
+
+[dependencies]
+libc = "0.2"
+log = "0.4"
+simple_logger = "1.6"
+rand = "0.7"
