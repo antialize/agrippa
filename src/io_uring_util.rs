@@ -1,9 +1,10 @@
 use crate::runtime::{io_uring_get_sqe_submit, waker_task, Error, Result, TaskRef, NOT_DONE};
 use crate::sys::{
-    io_uring_sqe, IORING_OP_ACCEPT, IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_READ,
-    IORING_OP_WRITE,
+    io_uring_sqe, IORING_OP_ACCEPT, IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_OPENAT,
+    IORING_OP_READ, IORING_OP_WRITE,
 };
 use libc;
+use log::debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -38,7 +39,10 @@ pub(super) struct Fd {
 impl Drop for Fd {
     fn drop(&mut self) {
         //TODO check for EAGAIN
-        unsafe { libc::close(self.fd) };
+        debug!("File closed synchronosly");
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -147,6 +151,14 @@ impl<'a> Accept<'a> {
     }
 }
 
+impl<'a> Drop for Accept<'a> {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
+        }
+    }
+}
+
 pub(super) struct Close {
     fd: Option<Fd>,
     state: IOUringFutureState,
@@ -196,9 +208,18 @@ impl Close {
     }
 }
 
+impl Drop for Close {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
+        }
+    }
+}
+
 pub(super) struct Write<'a> {
     fd: &'a Fd,
     data: &'a [u8],
+    offset: u64,
     state: IOUringFutureState,
 }
 
@@ -216,7 +237,7 @@ impl<'a> Future for Write<'a> {
                     self.fd.as_raw(),
                     self.data.as_ptr() as *const core::ffi::c_void as *mut core::ffi::c_void,
                     self.data.len() as u32,
-                    0,
+                    self.offset,
                     task,
                 )
             };
@@ -232,11 +253,20 @@ impl<'a> Future for Write<'a> {
 }
 
 impl<'a> Write<'a> {
-    pub(super) fn new(fd: &'a Fd, data: &'a [u8]) -> Self {
+    pub(super) fn new(fd: &'a Fd, data: &'a [u8], offset: u64) -> Self {
         Self {
             fd,
             data,
+            offset,
             state: IOUringFutureState::Initial,
+        }
+    }
+}
+
+impl<'a> Drop for Write<'a> {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
         }
     }
 }
@@ -244,6 +274,7 @@ impl<'a> Write<'a> {
 pub(super) struct Read<'a> {
     fd: &'a Fd,
     data: &'a mut [u8],
+    offset: u64,
     state: IOUringFutureState,
 }
 
@@ -261,7 +292,7 @@ impl<'a> Future for Read<'a> {
                     self.fd.as_raw(),
                     self.data.as_mut_ptr() as *mut core::ffi::c_void,
                     self.data.len() as u32,
-                    0,
+                    self.offset,
                     task,
                 )
             };
@@ -277,11 +308,20 @@ impl<'a> Future for Read<'a> {
 }
 
 impl<'a> Read<'a> {
-    pub(super) fn new(fd: &'a Fd, data: &'a mut [u8]) -> Self {
+    pub(super) fn new(fd: &'a Fd, data: &'a mut [u8], offset: u64) -> Self {
         Self {
             fd,
             data,
+            offset,
             state: IOUringFutureState::Initial,
+        }
+    }
+}
+
+impl<'a> Drop for Read<'a> {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
         }
     }
 }
@@ -326,6 +366,74 @@ impl<'a> Connect<'a> {
             addr,
             addr_size,
             state: IOUringFutureState::Initial,
+        }
+    }
+}
+
+impl<'a> Drop for Connect<'a> {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
+        }
+    }
+}
+
+pub(super) struct OpenAt<'a> {
+    path: &'a std::ffi::CStr,
+    dirfd: Option<&'a Fd>,
+    flags: u32,
+    mode: u32,
+    state: IOUringFutureState,
+}
+
+impl<'a> OpenAt<'a> {
+    pub(super) fn new(
+        path: &'a std::ffi::CStr,
+        dirfd: Option<&'a Fd>,
+        flags: u32,
+        mode: u32,
+    ) -> Self {
+        Self {
+            path,
+            dirfd,
+            flags,
+            mode,
+            state: IOUringFutureState::Initial,
+        }
+    }
+}
+
+impl<'a> Future for OpenAt<'a> {
+    type Output = Result<Fd>;
+    fn poll(mut self: Pin<&mut Self>, context: &mut std::task::Context) -> Poll<Self::Output> {
+        let (state, res) = io_uring_poll_impl(self.state, context, &mut |sqe, task| {
+            unsafe {
+                prep_rw(
+                    IORING_OP_OPENAT,
+                    sqe,
+                    self.dirfd.map(|v| v.as_raw()).unwrap_or(libc::AT_FDCWD),
+                    self.path.as_ptr() as *mut libc::c_void,
+                    self.mode,
+                    0,
+                    task,
+                );
+                sqe.__bindgen_anon_3.open_flags = self.flags;
+            };
+            Ok(())
+        });
+        self.state = state;
+        match res {
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(None) => Poll::Pending,
+            Ok(Some(ret)) => Poll::Ready(Ok(Fd { fd: ret })),
+        }
+    }
+}
+
+impl<'a> Drop for OpenAt<'a> {
+    fn drop(&mut self) {
+        if let IOUringFutureState::Sent = self.state {
+            panic!("io_uring future dropped while in progress");
         }
     }
 }

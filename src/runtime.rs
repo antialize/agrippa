@@ -2,7 +2,7 @@ use crate::sys::{
     __io_uring_get_cqe, io_uring, io_uring_cqe, io_uring_get_sqe, io_uring_queue_exit,
     io_uring_queue_init, io_uring_sqe, io_uring_submit,
 };
-use crate::verbs_util;
+
 use log::info;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -10,6 +10,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
 pub(super) const NOT_DONE: i32 = -2147483646;
+
+#[cfg(feature = "verbs")]
+use crate::verbs_util;
 
 #[derive(Copy, Clone)]
 pub enum Priority {
@@ -54,12 +57,19 @@ pub enum Error {
     Timeout,
     Eof,
     Internal(&'static str),
+    NulError(std::ffi::NulError),
     Boxed(Box<dyn std::error::Error>),
 }
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Error::Io(error)
+    }
+}
+
+impl From<std::ffi::NulError> for Error {
+    fn from(error: std::ffi::NulError) -> Self {
+        Error::NulError(error)
     }
 }
 
@@ -71,6 +81,7 @@ impl std::fmt::Display for Error {
             Error::Timeout => write!(f, "Timeout"),
             Error::Eof => write!(f, "Eof"),
             Error::Internal(s) => write!(f, "Internal error: {}", s),
+            Error::NulError(e) => write!(f, "NulError: {}", e),
             Error::Boxed(e) => write!(f, "{}", e.as_ref()),
         }
     }
@@ -190,32 +201,40 @@ impl PartialOrd for TimeEvent {
 pub struct Reactor {
     ready: RefCell<TaskQueue>,
     pub(super) ring: RefCell<io_uring>,
+    #[cfg(feature = "verbs")]
     pub device: RefCell<verbs_util::Device>,
+    #[cfg(feature = "verbs")]
     waiting_for_verbs_buffer: RefCell<TaskQueue>,
 }
 
 pub(super) type ReactorRef = Rc<Reactor>;
 
 impl Reactor {
+    #[cfg(feature = "verbs")]
     pub(super) fn wait_verbs_buffer(&self, t: TaskRef) {
         self.waiting_for_verbs_buffer.borrow_mut().push(t)
     }
 
+    #[cfg(feature = "verbs")]
     pub(super) fn get_verbs_buffer(&self) -> Option<verbs_util::Buffer> {
         self.device.borrow_mut().free_buffers.pop()
     }
 
+    #[cfg(feature = "verbs")]
     pub(super) fn put_verbs_buffer(&self, buffer: verbs_util::Buffer) {
         self.device.borrow_mut().free_buffers.push(buffer)
     }
 
     pub fn new(size: u32) -> Result<ReactorRef> {
+        #[cfg(feature = "verbs")]
         let mut device = verbs_util::Device::new(None, size)?;
 
         let mut r = Rc::new(Reactor {
             ready: RefCell::new(TaskQueue::new()),
             ring: unsafe { std::mem::zeroed() },
+            #[cfg(feature = "verbs")]
             device: RefCell::new(device),
+            #[cfg(feature = "verbs")]
             waiting_for_verbs_buffer: RefCell::new(TaskQueue::new()),
         });
 
@@ -243,12 +262,15 @@ impl Reactor {
         loop {
             // TODO (jakobt) possible post verbs recieve here
             // Poll verbs here
-            self.device.borrow_mut().process();
+            #[cfg(feature = "verbs")]
+            {
+                self.device.borrow_mut().process();
 
-            // Wake up a task waiting for free verbs buffers
-            if !self.device.borrow().free_buffers.is_empty() {
-                if let Some(v) = self.waiting_for_verbs_buffer.borrow_mut().pop() {
-                    self.ready.borrow_mut().push(v)
+                // Wake up a task waiting for free verbs buffers
+                if !self.device.borrow().free_buffers.is_empty() {
+                    if let Some(v) = self.waiting_for_verbs_buffer.borrow_mut().pop() {
+                        self.ready.borrow_mut().push(v)
+                    }
                 }
             }
 

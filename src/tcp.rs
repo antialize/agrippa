@@ -50,7 +50,7 @@ impl Socket {
         let mut start = 0;
         while start != data.len() {
             //TODO Handle EINTR and EAGAIN
-            let written = Write::new(&self.fd, &data[start..]).await?;
+            let written = Write::new(&self.fd, &data[start..], 0).await?;
             if written == 0 {
                 return Err(Error::Eof);
             }
@@ -71,13 +71,13 @@ impl Socket {
 
     /// Read data from socket into data, return number of bytes read
     pub async fn read(&self, data: &mut [u8]) -> Result<usize> {
-        Read::new(&self.fd, data).await
+        Read::new(&self.fd, data, 0).await
     }
 
     pub async fn read_all(&self, data: &mut [u8]) -> Result<()> {
         let mut start = 0;
         while start != data.len() {
-            let read = Read::new(&self.fd, &mut data[start..]).await?;
+            let read = Read::new(&self.fd, &mut data[start..], 0).await?;
             if read == 0 {
                 return Err(Error::Eof);
             }
