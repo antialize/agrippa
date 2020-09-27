@@ -1,6 +1,6 @@
 use crate::sys::{
     __io_uring_get_cqe, io_uring, io_uring_cqe, io_uring_get_sqe, io_uring_queue_exit,
-    io_uring_queue_init, io_uring_sqe, io_uring_submit,
+    io_uring_queue_init, io_uring_sqe, io_uring_submit, IORING_OP_ASYNC_CANCEL,
 };
 
 use log::info;
@@ -9,7 +9,28 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
-pub(super) const NOT_DONE: i32 = -2147483646;
+
+fn io_uring_cancel(task: &TaskRef) -> Result<()> {
+    unsafe {
+        let mut sqep =
+            io_uring_get_sqe_submit(&mut *task.as_ref().reactor.as_ref().ring.borrow_mut())?;
+        let mut sqe = sqep.as_mut();
+
+        sqe.opcode = IORING_OP_ASYNC_CANCEL as u8;
+        sqe.flags = 0;
+        sqe.ioprio = 0;
+        sqe.fd = -1;
+        sqe.__bindgen_anon_1.off = 0;
+        sqe.__bindgen_anon_2.addr = Rc::as_ptr(task) as usize as u64;
+        sqe.len = 0;
+        sqe.__bindgen_anon_3.rw_flags = 0;
+        sqe.user_data = 0;
+        sqe.__bindgen_anon_4.__pad2[0] = 0;
+        sqe.__bindgen_anon_4.__pad2[1] = 0;
+        sqe.__bindgen_anon_4.__pad2[2] = 0;
+    }
+    Ok(())
+}
 
 #[cfg(feature = "verbs")]
 use crate::verbs_util;
@@ -95,16 +116,27 @@ impl std::error::Error for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Task {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TaskState {
+    Inital,
+    Cancled,
+    Timeouted,
+    UringWaiting,
+    UringCanceling,
+    UringTimeouting,
+    UringDone(i32),
+}
+
+pub(super) struct TaskContent {
     future: RefCell<Pin<Box<dyn Future<Output = Result<()>> + 'static>>>,
     priority: Priority,
     pub(super) reactor: ReactorRef,
-    pub(super) ring_result: Cell<i32>,
+    pub(super) state: Cell<TaskState>,
 }
 
-pub type TaskRef = Rc<Task>;
+pub(super) type TaskRef = Rc<TaskContent>;
 
-impl Task {
+impl TaskContent {
     fn wake(self: TaskRef) {
         let s = self.clone();
         let r = self.as_ref().reactor.as_ref();
@@ -116,35 +148,72 @@ impl Task {
         priority: Priority,
         reactor: ReactorRef,
     ) -> Self {
-        Task {
+        TaskContent {
             future: RefCell::new(Box::pin(future)),
             priority,
             reactor,
-            ring_result: Cell::new(NOT_DONE),
+            state: Cell::new(TaskState::Inital),
         }
     }
 }
 
+#[derive(Clone)]
+pub struct Task {
+    content: TaskRef,
+}
+
+impl Task {
+    pub fn cancel(&self) -> Result<()> {
+        let s = match self.content.state.get() {
+            TaskState::Inital => TaskState::Cancled,
+            TaskState::UringWaiting => {
+                io_uring_cancel(&self.content)?;
+                TaskState::UringCanceling
+            }
+            TaskState::UringDone(_) => TaskState::Cancled,
+            v => v,
+        };
+        self.content.state.set(s);
+        Ok(())
+    }
+
+    pub fn timeout(&self) -> Result<()> {
+        let s = match self.content.state.get() {
+            TaskState::Inital => TaskState::Timeouted,
+            TaskState::UringWaiting => {
+                io_uring_cancel(&self.content)?;
+                TaskState::UringTimeouting
+            }
+            TaskState::UringDone(_) => TaskState::Timeouted,
+            v => v,
+        };
+        self.content.state.set(s);
+        Ok(())
+    }
+
+    pub async fn wait(&self) {}
+}
+
 unsafe fn waker_clone(data: *const ()) -> std::task::RawWaker {
-    let task = TaskRef::from_raw(data as *const Task);
+    let task = TaskRef::from_raw(data as *const TaskContent);
     let t2 = task.clone();
     Rc::into_raw(t2); //incref
     std::task::RawWaker::new(Rc::into_raw(task) as *const (), &WAKER_VTABLE)
 }
 
 unsafe fn waker_wake(data: *const ()) {
-    let task = TaskRef::from_raw(data as *const Task);
+    let task = TaskRef::from_raw(data as *const TaskContent);
     task.wake();
 }
 
 unsafe fn waker_wake_by_ref(data: *const ()) {
-    let task = TaskRef::from_raw(data as *const Task);
-    Task::wake(task.clone());
+    let task = TaskRef::from_raw(data as *const TaskContent);
+    TaskContent::wake(task.clone());
     Rc::into_raw(task);
 }
 
 unsafe fn waker_drop(data: *const ()) {
-    TaskRef::from_raw(data as *const Task);
+    TaskRef::from_raw(data as *const TaskContent);
 }
 
 const WAKER_VTABLE: std::task::RawWakerVTable =
@@ -167,7 +236,7 @@ pub(super) fn waker_task(waker: std::task::Waker) -> TaskRef {
                 .as_ref()
                 .unwrap()
                 .waker
-                .data as *const Task,
+                .data as *const TaskContent,
         )
     };
     std::mem::forget(waker);
@@ -252,10 +321,10 @@ impl Reactor {
         self: &ReactorRef,
         priority: Priority,
         future: F,
-    ) -> TaskRef {
-        let task = TaskRef::new(Task::new(future, priority, self.clone()));
+    ) -> Task {
+        let task = TaskRef::new(TaskContent::new(future, priority, self.clone()));
         self.ready.borrow_mut().push(task.clone());
-        task
+        Task { content: task }
     }
 
     pub fn run(self: &ReactorRef) -> Result<()> {
@@ -320,8 +389,17 @@ impl Reactor {
                     .as_mut()
                     .ok_or(Error::Internal("Got null cqe pointer"))?;
 
-                let task = TaskRef::from_raw(cqe.user_data as *const Task);
-                task.as_ref().ring_result.set(cqe.res);
+                let task = TaskRef::from_raw(cqe.user_data as *const TaskContent);
+
+                match task.as_ref().state.get() {
+                    TaskState::UringWaiting => {
+                        task.as_ref().state.set(TaskState::UringDone(cqe.res))
+                    }
+                    TaskState::UringCanceling => task.as_ref().state.set(TaskState::Cancled),
+                    TaskState::UringTimeouting => task.as_ref().state.set(TaskState::Timeouted),
+                    v => panic!("Unexpected task state on uring result {:?}", v),
+                }
+
                 self.ready.borrow_mut().push(task);
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
                 *ring.cq.khead.as_mut().unwrap() += 1;
