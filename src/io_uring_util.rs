@@ -168,7 +168,6 @@ impl<M: IOUringMethod> Future for IOUringFeature<M> {
         };
         task.state.set(ts);
         self.state = s;
-        //self.as_mut().state.set(s);
         return r;
     }
 }
