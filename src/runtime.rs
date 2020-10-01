@@ -221,7 +221,7 @@ const WAKER_VTABLE: std::task::RawWakerVTable =
 
 struct UnsafeRawWaker {
     data: *const (),
-    vtable: &'static std::task::RawWakerVTable,
+    _vtable: &'static std::task::RawWakerVTable,
 }
 
 #[repr(transparent)]
@@ -294,9 +294,9 @@ impl Reactor {
         self.device.borrow_mut().free_buffers.push(buffer)
     }
 
-    pub fn new(size: u32) -> Result<ReactorRef> {
+    pub fn new(_size: u32) -> Result<ReactorRef> {
         #[cfg(feature = "verbs")]
-        let mut device = verbs_util::Device::new(None, size)?;
+        let mut device = verbs_util::Device::new(None, _size)?;
 
         let mut r = Rc::new(Reactor {
             ready: RefCell::new(TaskQueue::new()),
@@ -375,7 +375,7 @@ impl Reactor {
             unsafe {
                 // TODO we should handle all entries here
                 let mut ring = self.ring.borrow_mut();
-                unsafe { io_uring_submit(&mut *ring) };
+                io_uring_submit(&mut *ring);
 
                 let mut cqe: *mut io_uring_cqe = std::ptr::null_mut();
                 info!("Wait for event");
@@ -421,7 +421,7 @@ pub(super) fn io_uring_get_sqe_submit(
     ring: *mut io_uring,
 ) -> Result<std::ptr::NonNull<io_uring_sqe>> {
     loop {
-        let mut sqe = unsafe { io_uring_get_sqe(ring) };
+        let sqe = unsafe { io_uring_get_sqe(ring) };
         if let Some(p) = std::ptr::NonNull::new(sqe) {
             return Ok(p);
         }

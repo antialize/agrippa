@@ -114,7 +114,7 @@ impl<M: IOUringMethod> Future for IOUringFeature<M> {
                         Poll::Ready(Err(e)),
                     ),
                     Ok(mut sqe) => unsafe {
-                        if let Err(e) = self.method.call(unsafe { sqe.as_mut() }, task.clone()) {
+                        if let Err(e) = self.method.call(sqe.as_mut(), task.clone()) {
                             (
                                 TaskState::Inital,
                                 IOUringFutureState::Done,

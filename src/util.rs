@@ -34,7 +34,7 @@ struct SpawnTaskFuture<F: Future<Output = Result<()>> + 'static> {
 
 impl<F: Future<Output = Result<()>> + 'static> Future for SpawnTaskFuture<F> {
     type Output = Result<Task>;
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
         let p = self.priority;
         if let Some(f) = unsafe { self.get_unchecked_mut() }.future.take() {
             let task = waker_task(context.waker().clone());

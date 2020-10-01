@@ -1,7 +1,6 @@
 use crate::io_uring_util::{Accept, Close, Connect, Fd, Read, Write};
 use crate::runtime::{Error, Result};
 use libc;
-use log::info;
 use std::net::TcpListener;
 
 /// Listening socket that can be used to accept connections
@@ -12,7 +11,7 @@ pub struct ListenSocket {
 impl ListenSocket {
     /// Accept a new connection from the socket
     pub async fn accept(&self) -> Result<Socket> {
-        let (fd, address, len) = Accept::new(&self.fd).await?;
+        let (fd, _address, _len) = Accept::new(&self.fd).await?;
         Ok(Socket { fd })
     }
 
